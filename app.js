@@ -1211,7 +1211,7 @@ function processResults(result) {
 
   statusDot.className = puzzle.solved ? "status-dot solved" : "status-dot live";
 
-  const anyFist = handsLandmarks.some((lm) => isFist(lm) && !isPinching(lm, PINCH_RELEASE_THRESHOLD));
+  const anyFist = handsLandmarks.some((lm) => isFist(lm));
   const draggingNow = drag.activeHand !== null && drag.piece !== null;
   if (anyFist && !draggingNow && appState !== "tracking") {
     fistHoldCounter++;
