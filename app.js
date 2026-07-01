@@ -1,7 +1,31 @@
-import {
-  FilesetResolver,
-  HandLandmarker,
-} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+// Loaded dynamically (see loadVisionSdk) so a single blocked/slow CDN doesn't hard-fail the app.
+const VISION_SDK_VERSION = "0.10.14";
+const VISION_SDK_SOURCES = [
+  `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VISION_SDK_VERSION}/vision_bundle.mjs`,
+  `https://unpkg.com/@mediapipe/tasks-vision@${VISION_SDK_VERSION}/vision_bundle.mjs`,
+];
+const WASM_SOURCES = [
+  `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VISION_SDK_VERSION}/wasm`,
+  `https://unpkg.com/@mediapipe/tasks-vision@${VISION_SDK_VERSION}/wasm`,
+];
+
+let FilesetResolver, HandLandmarker;
+
+async function loadVisionSdk() {
+  let lastErr;
+  for (const src of VISION_SDK_SOURCES) {
+    try {
+      const mod = await import(/* @vite-ignore */ src);
+      FilesetResolver = mod.FilesetResolver;
+      HandLandmarker = mod.HandLandmarker;
+      return;
+    } catch (err) {
+      console.warn("[PuzzleCam] vision SDK source failed, trying next mirror…", src, err);
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error("Could not load the hand-tracking SDK from any CDN mirror.");
+}
 
 const LM = {
   WRIST: 0,
@@ -17,6 +41,7 @@ const LM = {
 };
 
 const PINCH_THRESHOLD = 0.055;
+const PINCH_RELEASE_THRESHOLD = 0.085; // looser than grab threshold — avoids flicker-drops while holding a piece
 const FRAME_PADDING = 28;
 const FREEZE_HOLD_MS = 250;
 const COUNTDOWN_SECONDS = 3;
@@ -171,7 +196,15 @@ const recorder = {
   blob: null,
 };
 
+const RECORDING_SUPPORTED = typeof MediaRecorder !== "undefined" && typeof canvas.captureStream === "function";
+if (!RECORDING_SUPPORTED && downloadVideoBtn) {
+  downloadVideoBtn.disabled = true;
+  downloadVideoBtn.title = "Video recording isn't supported in this browser";
+  downloadVideoBtn.textContent = "video unsupported";
+}
+
 function startRecording() {
+  if (!RECORDING_SUPPORTED) return;
   recorder.chunks = [];
   recorder.blob = null;
   downloadVideoBtn.disabled = true;
@@ -368,6 +401,8 @@ function resetPuzzleOnly() {
   countdown.active = false;
   drag.activeHand = null;
   drag.piece = null;
+  dragMissCounter = 0;
+  stillness.box = null;
   shatter.active = false;
   shatter.fragments = [];
   shatter.pendingCanvas = null;
@@ -399,19 +434,37 @@ function fitCanvasToWindow() {
 }
 
 window.addEventListener("resize", fitCanvasToWindow);
+window.addEventListener("orientationchange", () => setTimeout(fitCanvasToWindow, 250));
+
+const WEBCAM_CONSTRAINTS = [
+  { video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" }, audio: false },
+  // Lower-res fallback for older/slower phones or cameras that reject the constraints above
+  { video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" }, audio: false },
+  { video: { facingMode: "user" }, audio: false },
+];
 
 async function initWebcam() {
   if (!navigator.mediaDevices?.getUserMedia) {
     throw new Error("This browser does not support getUserMedia.");
   }
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
-    audio: false,
-  });
+  let stream, lastErr;
+  for (const constraints of WEBCAM_CONSTRAINTS) {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      // Permission/hardware errors won't be fixed by relaxing constraints — bail immediately.
+      if (err && (err.name === "NotAllowedError" || err.name === "NotFoundError")) throw err;
+      console.warn("[PuzzleCam] camera constraints rejected, trying a lighter fallback…", constraints, err);
+    }
+  }
+  if (!stream) throw lastErr || new Error("Could not start the camera.");
   videoEl.srcObject = stream;
   await new Promise((resolve) => {
     videoEl.onloadedmetadata = () => {
-      videoEl.play();
+      videoEl.play().catch((err) => console.warn("[PuzzleCam] video.play() rejected:", err));
       resolve();
     };
   });
@@ -430,17 +483,22 @@ function withTimeout(promise, ms, timeoutMessage) {
 
 async function initHandLandmarker() {
   let vision;
-  try {
-    vision = await withTimeout(
-      FilesetResolver.forVisionTasks(
-        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-      ),
-      LOAD_TIMEOUT_MS,
-      "Timed out loading MediaPipe WASM runtime. Check your internet connection."
-    );
-  } catch (err) {
-    throw err;
+  let lastErr;
+  for (const wasmSrc of WASM_SOURCES) {
+    try {
+      vision = await withTimeout(
+        FilesetResolver.forVisionTasks(wasmSrc),
+        LOAD_TIMEOUT_MS,
+        "Timed out loading MediaPipe WASM runtime. Check your internet connection."
+      );
+      lastErr = null;
+      break;
+    } catch (err) {
+      console.warn("[PuzzleCam] WASM source failed, trying next mirror…", wasmSrc, err);
+      lastErr = err;
+    }
   }
+  if (lastErr) throw lastErr;
   try {
     const handLandmarker = await withTimeout(
       HandLandmarker.createFromOptions(vision, {
@@ -491,8 +549,19 @@ function dist2D(a, b) {
   return Math.sqrt(dx * dx + dy * dy);
 }
 
-function isPinching(landmarks) {
-  return dist2D(landmarks[LM.THUMB_TIP], landmarks[LM.INDEX_TIP]) < PINCH_THRESHOLD;
+function isPinching(landmarks, threshold = PINCH_THRESHOLD) {
+  return dist2D(landmarks[LM.THUMB_TIP], landmarks[LM.INDEX_TIP]) < threshold;
+}
+
+// MediaPipe's `landmarks` array order is NOT guaranteed to stay stable frame-to-frame
+// once two hands are visible — the SDK can swap which hand is index 0 vs 1. Using the
+// positional index as a drag "owner" id caused pieces to get orphaned or hijacked
+// mid-drag (the actual "arranging doesn't work" bug). `handedness` (Left/Right) is
+// tied to the physical hand, not array position, so use that as the stable id instead.
+function getHandLabel(result, i) {
+  const cats = (result.handedness || result.handednesses || [])[i];
+  const name = cats && cats[0] && cats[0].categoryName;
+  return name || (i === 0 ? "A" : "B");
 }
 
 function isFist(landmarks) {
@@ -537,6 +606,25 @@ const FRAME_GRACE_MS = 450;
 const lastSeenFrame = { box: null, at: 0 };
 const countdown = { active: false, startedAt: 0 };
 let lastCountdownN = -1;
+
+// Auto-capture: if the person just holds a two-hand box still (no pinch needed)
+// for STILLNESS_HOLD_MS, kick off the same 3s countdown automatically. Pinching
+// both hands is still a faster manual shortcut (FREEZE_HOLD_MS) — whichever
+// happens first wins.
+const STILLNESS_HOLD_MS = 2000;
+const STILLNESS_POS_TOLERANCE = 22; // px the box may drift while still "held"
+const STILLNESS_SIZE_TOLERANCE = 26;
+const stillness = { box: null, since: 0 };
+
+function isFrameStable(a, b) {
+  if (!a || !b) return false;
+  const dCx = Math.abs((a.x + a.width / 2) - (b.x + b.width / 2));
+  const dCy = Math.abs((a.y + a.height / 2) - (b.y + b.height / 2));
+  const dW = Math.abs(a.width - b.width);
+  const dH = Math.abs(a.height - b.height);
+  return dCx < STILLNESS_POS_TOLERANCE && dCy < STILLNESS_POS_TOLERANCE
+    && dW < STILLNESS_SIZE_TOLERANCE && dH < STILLNESS_SIZE_TOLERANCE;
+}
 
 function startCountdown(frameBox) {
   puzzle.boardBox = { ...frameBox };
@@ -699,6 +787,8 @@ function finishCountdownAndCapture(box) {
 }
 
 const drag = { activeHand: null, piece: null, offsetX: 0, offsetY: 0 };
+const DRAG_MISS_GRACE_FRAMES = 3; // tolerate a couple of dropped detection frames before releasing a held piece
+let dragMissCounter = 0;
 
 function isNearOwnCell(piece, box, tileW, tileH) {
   const correctX = box.x + piece.col * tileW;
@@ -1097,6 +1187,7 @@ function processResults(result) {
     statusDot.className = puzzle.solved ? "status-dot solved" : "status-dot";
     fistHoldCounter = 0;
     freezeGate.holding = false;
+    stillness.box = null;
     if (drag.activeHand && drag.piece) handleDragForHand(drag.activeHand, false, { x: drag.piece.x, y: drag.piece.y });
     if (appState === "tracking") {
       const sinceLastSeen = performance.now() - lastSeenFrame.at;
@@ -1120,7 +1211,7 @@ function processResults(result) {
 
   statusDot.className = puzzle.solved ? "status-dot solved" : "status-dot live";
 
-  const anyFist = handsLandmarks.some((lm) => isFist(lm));
+  const anyFist = handsLandmarks.some((lm) => isFist(lm) && !isPinching(lm, PINCH_RELEASE_THRESHOLD));
   const draggingNow = drag.activeHand !== null && drag.piece !== null;
   if (anyFist && !draggingNow && appState !== "tracking") {
     fistHoldCounter++;
@@ -1143,17 +1234,40 @@ function processResults(result) {
         lastSeenFrame.at = performance.now();
       }
       const bothPinching = isPinching(handA) && isPinching(handB);
-      if (bothPinching && frameBox.width > 40 && frameBox.height > 40) {
+      const bigEnough = frameBox.width > 40 && frameBox.height > 40;
+
+      if (bothPinching && bigEnough) {
+        // Manual fast-path: hold a two-hand pinch briefly to start right away.
         if (!freezeGate.holding) { freezeGate.holding = true; freezeGate.since = performance.now(); }
+        stillness.box = null;
         statusDot.className = "status-dot armed";
         statusText.textContent = "hold the pinch…";
         if (performance.now() - freezeGate.since > FREEZE_HOLD_MS) { freezeGate.holding = false; startCountdown(frameBox); }
       } else {
         freezeGate.holding = false;
-        statusText.textContent = "hands tracking";
+        if (bigEnough) {
+          // Auto-path: just hold the box still, no pinch required.
+          if (!isFrameStable(stillness.box, frameBox)) {
+            stillness.box = frameBox;
+            stillness.since = performance.now();
+          }
+          const elapsed = performance.now() - stillness.since;
+          if (elapsed >= STILLNESS_HOLD_MS) {
+            stillness.box = null;
+            startCountdown(frameBox);
+          } else {
+            const remaining = ((STILLNESS_HOLD_MS - elapsed) / 1000).toFixed(1);
+            statusDot.className = "status-dot armed";
+            statusText.textContent = `hold still — auto-capture in ${remaining}s (or pinch both hands to start now)`;
+          }
+        } else {
+          stillness.box = null;
+          statusText.textContent = "hands tracking";
+        }
       }
     } else {
       freezeGate.holding = false;
+      stillness.box = null;
       const sinceLastSeen = performance.now() - lastSeenFrame.at;
       if (lastSeenFrame.box && sinceLastSeen < FRAME_GRACE_MS) {
         applyColorInsideBox(lastSeenFrame.box);
@@ -1169,14 +1283,21 @@ function processResults(result) {
   if (appState === "puzzle") {
     const labelsPresent = new Set();
     handsLandmarks.forEach((lm, i) => {
-      const label = i === 0 ? "A" : "B";
+      const label = getHandLabel(result, i);
       labelsPresent.add(label);
-      const pinching = isPinching(lm);
+      const alreadyHolding = drag.activeHand === label && drag.piece;
+      const pinching = isPinching(lm, alreadyHolding ? PINCH_RELEASE_THRESHOLD : PINCH_THRESHOLD);
       const indexPx = toPixel(mirrorLandmarkX(lm[LM.INDEX_TIP]));
       handleDragForHand(label, pinching, indexPx);
     });
     if (drag.activeHand && !labelsPresent.has(drag.activeHand) && drag.piece) {
-      handleDragForHand(drag.activeHand, false, { x: drag.piece.x, y: drag.piece.y });
+      dragMissCounter++;
+      if (dragMissCounter > DRAG_MISS_GRACE_FRAMES) {
+        dragMissCounter = 0;
+        handleDragForHand(drag.activeHand, false, { x: drag.piece.x, y: drag.piece.y });
+      }
+    } else {
+      dragMissCounter = 0;
     }
     if (!drag.piece) {
       puzzle.solved = reconcilePlacedState(puzzle.boardBox, puzzle.tileW, puzzle.tileH);
@@ -1227,7 +1348,15 @@ async function boot() {
     if (!settled) showLoaderError("Loading is taking too long. Click retry or check your connection.");
   }, watchdogMs);
   try {
-    if (!videoEl.srcObject) await initWebcam();
+    if (!FilesetResolver || !HandLandmarker) {
+      loaderText.textContent = "loading hand-tracking SDK…";
+      await loadVisionSdk();
+    }
+    if (!videoEl.srcObject) {
+      loaderText.textContent = "requesting camera…";
+      await initWebcam();
+    }
+    loaderText.textContent = "loading HandLandmarker model…";
     handLandmarker = await initHandLandmarker();
     settled = true;
     clearTimeout(watchdog);
@@ -1246,6 +1375,38 @@ async function boot() {
     }
   }
 }
+
+// ── Guide / how-to-use modal ──────────────────────────────────────────────────
+const GUIDE_SEEN_KEY = "puzzlecam_guide_seen";
+const guideModal = document.getElementById("guideModal");
+const guideCloseBtn = document.getElementById("guideCloseBtn");
+const helpBtn = document.getElementById("helpBtn");
+
+function openGuide() {
+  if (guideModal) guideModal.classList.remove("hidden");
+}
+function closeGuide() {
+  if (guideModal) guideModal.classList.add("hidden");
+  try { localStorage.setItem(GUIDE_SEEN_KEY, "1"); } catch (_) {}
+}
+if (guideCloseBtn) guideCloseBtn.addEventListener("click", closeGuide);
+if (helpBtn) helpBtn.addEventListener("click", openGuide);
+if (guideModal) {
+  guideModal.addEventListener("click", (e) => { if (e.target === guideModal) closeGuide(); });
+}
+try {
+  if (!localStorage.getItem(GUIDE_SEEN_KEY)) openGuide();
+} catch (_) {
+  openGuide();
+}
+
+window.addEventListener("beforeunload", (e) => {
+  const inProgress = (appState === "countdown") || (appState === "puzzle" && !puzzle.solved);
+  if (!inProgress) return;
+  e.preventDefault();
+  e.returnValue = "You're mid-puzzle — leaving now will lose it. Stay?";
+  return e.returnValue;
+});
 
 loaderRetry.addEventListener("click", () => { boot(); });
 

@@ -2,8 +2,43 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>PuzzleCam — by aiwithunnati</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<title>PuzzleCam — Webcam Hand-Tracking Photo Puzzle | wondermayank</title>
+<meta name="description" content="PuzzleCam turns your webcam into a jigsaw puzzle game — frame a shot with your hands, solve the 3x3 puzzle by pinching pieces, then save a photo strip or clip. Free, browser-based, no install." />
+<meta name="keywords" content="webcam puzzle, hand tracking game, photo booth puzzle, browser jigsaw, gesture control game, wondermayank" />
+<meta name="author" content="wondermayank" />
+<meta name="theme-color" content="#0a0a08" />
+<link rel="canonical" href="https://wondermayank.github.io/puzzle/" />
+
+<meta property="og:type" content="website" />
+<meta property="og:title" content="PuzzleCam — Webcam Hand-Tracking Photo Puzzle" />
+<meta property="og:description" content="Frame a shot with your hands, solve a 3x3 puzzle by pinching pieces on-screen, then save your photo strip. All in the browser, powered by MediaPipe hand tracking." />
+<meta property="og:url" content="https://wondermayank.github.io/puzzle/" />
+<meta property="og:image" content="https://wondermayank.github.io/og-image.png" />
+<meta property="og:site_name" content="wondermayank" />
+
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="PuzzleCam — Webcam Hand-Tracking Photo Puzzle" />
+<meta name="twitter:description" content="Frame a shot with your hands, solve a 3x3 puzzle by pinching pieces on-screen, then save your photo strip." />
+<meta name="twitter:image" content="https://wondermayank.github.io/og-image.png" />
+
+<link rel="icon" type="image/svg+xml" href="https://wondermayank.github.io/favicon.svg">
+<link rel="apple-touch-icon" href="https://wondermayank.github.io/favicon.svg">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "WebApplication",
+  "name": "PuzzleCam",
+  "applicationCategory": "GameApplication",
+  "operatingSystem": "Any (browser-based)",
+  "description": "PuzzleCam turns your webcam into a jigsaw puzzle game controlled entirely by hand gestures — pinch to frame a photo, pinch to arrange puzzle pieces, and make a fist to save it to a photo strip.",
+  "url": "https://wondermayank.github.io/puzzle/",
+  "author": { "@type": "Person", "name": "wondermayank", "url": "https://wondermayank.github.io/" },
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+}
+</script>
+
 <link rel="stylesheet" href="css/styles.css" />
 </head>
 <body>
@@ -15,10 +50,13 @@
     <canvas id="sceneCanvas"></canvas>
 
     <div class="hud-top">
-      <div class="brand">PUZZLE·CAM <small>by aiwithunnati</small></div>
-      <div class="status-pill">
-        <span id="statusDot" class="status-dot"></span>
-        <span id="statusText">starting camera…</span>
+      <div class="brand">PUZZLE·CAM <small>by wondermayank</small></div>
+      <div class="hud-top-right">
+        <div class="status-pill">
+          <span id="statusDot" class="status-dot"></span>
+          <span id="statusText">starting camera…</span>
+        </div>
+        <button type="button" id="helpBtn" class="help-btn" aria-label="How to play">?</button>
       </div>
     </div>
 
@@ -65,7 +103,25 @@
 
 </div>
 
-<div class="copyright">© 2026 aiwithunnati — all rights reserved</div>
+<div class="copyright">© 2026 wondermayank — PuzzleCam <a href="https://wondermayank.github.io/" target="_blank" rel="noopener">wondermayank.github.io</a></div>
+
+<div id="guideModal" class="strip-modal guide-modal hidden">
+  <div class="strip-modal-inner guide-modal-inner">
+    <div class="strip-modal-title">HOW TO PLAY</div>
+    <ol class="guide-steps">
+      <li><strong>Frame the shot.</strong> Hold up both index fingers to form a rectangle and hold it steady — it auto-captures after about 2 seconds. Or pinch both thumb + index fingers together to start it instantly.</li>
+      <li><strong>Countdown.</strong> A 3-2-1 countdown appears — stay in frame until the flash. That crop becomes your puzzle.</li>
+      <li><strong>Arrange the pieces.</strong> Pinch a piece with one hand and drag it into its matching grid cell. Release the pinch to drop it.</li>
+      <li><strong>Save it.</strong> When the board glows green, make a fist and hold it for about a second to save the finished photo to your strip.</li>
+      <li><strong>Repeat &amp; download.</strong> Do this up to 3 times, then use "download strip" or "download video" in the side panel.</li>
+    </ol>
+    <p class="guide-note">Tip: good, even lighting helps hand tracking a lot. If a piece won't budge, try a slightly slower, clearer pinch.</p>
+    <div class="strip-modal-actions">
+      <button type="button" id="guideCloseBtn" class="strip-modal-btn">got it</button>
+    </div>
+    <div class="guide-modal-footer">PuzzleCam by <a href="https://wondermayank.github.io/" target="_blank" rel="noopener">wondermayank</a></div>
+  </div>
+</div>
 
 <div id="stripModal" class="strip-modal hidden">
   <div class="strip-modal-inner">
