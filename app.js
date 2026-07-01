@@ -401,6 +401,7 @@ function resetPuzzleOnly() {
   countdown.active = false;
   drag.activeHand = null;
   drag.piece = null;
+  drag.releaseMisses = 0;
   dragMissCounter = 0;
   stillness.box = null;
   shatter.active = false;
@@ -786,8 +787,10 @@ function finishCountdownAndCapture(box) {
   startRecording();
 }
 
-const drag = { activeHand: null, piece: null, offsetX: 0, offsetY: 0 };
+const drag = { activeHand: null, piece: null, offsetX: 0, offsetY: 0, releaseMisses: 0 };
 const DRAG_MISS_GRACE_FRAMES = 3; // tolerate a couple of dropped detection frames before releasing a held piece
+const PINCH_RELEASE_GRACE_FRAMES = 2; // tolerate brief "unpinched" blips mid-move without dropping the piece
+const DRAG_SMOOTHING = 0.55; // 0-1, higher = snappier/less smoothing
 let dragMissCounter = 0;
 
 function isNearOwnCell(piece, box, tileW, tileH) {
@@ -882,7 +885,7 @@ function findNearestPiece(px, py) {
     const cx = piece.x + piece.w / 2;
     const cy = piece.y + piece.h / 2;
     const d = Math.hypot(px - cx, py - cy);
-    if (d < Math.max(piece.w, piece.h) * 0.75 && d < bestDist) {
+    if (d < Math.max(piece.w, piece.h) * 0.95 && d < bestDist) {
       best = piece;
       bestDist = d;
     }
@@ -899,15 +902,26 @@ function handleDragForHand(handLabel, pinching, indexPx) {
         drag.piece = candidate;
         drag.offsetX = indexPx.x - candidate.x;
         drag.offsetY = indexPx.y - candidate.y;
+        drag.releaseMisses = 0;
         candidate.dragging = true;
         candidate.placed = false;
       }
     } else if (drag.activeHand === handLabel && drag.piece) {
-      drag.piece.x = indexPx.x - drag.offsetX;
-      drag.piece.y = indexPx.y - drag.offsetY;
+      drag.releaseMisses = 0;
+      const targetX = indexPx.x - drag.offsetX;
+      const targetY = indexPx.y - drag.offsetY;
+      // Smooth toward the target instead of snapping exactly to the raw landmark —
+      // damps jitter so the piece doesn't feel like it "escapes" your fingers.
+      drag.piece.x += (targetX - drag.piece.x) * DRAG_SMOOTHING;
+      drag.piece.y += (targetY - drag.piece.y) * DRAG_SMOOTHING;
     }
   } else {
     if (drag.activeHand === handLabel && drag.piece) {
+      // A single noisy frame can briefly read as "not pinching" mid-move — tolerate
+      // a couple of consecutive misses before actually treating it as a release.
+      drag.releaseMisses = (drag.releaseMisses || 0) + 1;
+      if (drag.releaseMisses <= PINCH_RELEASE_GRACE_FRAMES) return;
+      drag.releaseMisses = 0;
       const piece = drag.piece;
       piece.dragging = false;
       if (isNearOwnCell(piece, puzzle.boardBox, puzzle.tileW, puzzle.tileH)) {
@@ -937,6 +951,49 @@ function clampPieceToBoard(piece) {
   piece.x = Math.min(Math.max(piece.x, box.x), box.x + box.width - piece.w);
   piece.y = Math.min(Math.max(piece.y, box.y), box.y + box.height - piece.h);
 }
+
+// ── Mouse / touch fallback ────────────────────────────────────────────────────
+// Solving with hand gestures is the headline feature, but a mouse or a finger on
+// touch screens should work too. Reuses handleDragForHand with a "pointer" label
+// so all the existing snap/displace/sound logic is shared, not duplicated.
+let activePointerId = null;
+
+function canvasPixelFromEvent(e) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  return { x: (e.clientX - rect.left) * scaleX, y: (e.clientY - rect.top) * scaleY };
+}
+
+canvas.addEventListener("pointerdown", (e) => {
+  if (appState !== "puzzle" || awaitingCloseConfirm || drag.activeHand) return;
+  const p = canvasPixelFromEvent(e);
+  handleDragForHand("pointer", true, p);
+  if (drag.activeHand === "pointer") {
+    activePointerId = e.pointerId;
+    canvas.setPointerCapture(e.pointerId);
+    canvas.style.cursor = "grabbing";
+    e.preventDefault();
+  }
+});
+
+canvas.addEventListener("pointermove", (e) => {
+  if (drag.activeHand !== "pointer" || e.pointerId !== activePointerId) return;
+  handleDragForHand("pointer", true, canvasPixelFromEvent(e));
+  e.preventDefault();
+});
+
+function releasePointerDrag(e) {
+  if (drag.activeHand !== "pointer") return;
+  if (e && e.pointerId !== undefined && e.pointerId !== activePointerId) return;
+  drag.releaseMisses = PINCH_RELEASE_GRACE_FRAMES + 1; // release immediately, no jitter grace needed for a real pointer
+  handleDragForHand("pointer", false, { x: drag.piece.x, y: drag.piece.y });
+  activePointerId = null;
+  canvas.style.cursor = "";
+}
+canvas.addEventListener("pointerup", releasePointerDrag);
+canvas.addEventListener("pointercancel", releasePointerDrag);
+canvas.addEventListener("pointerleave", releasePointerDrag);
 
 function drawBoardAndPieces() {
   const box = puzzle.boardBox;
@@ -1188,7 +1245,7 @@ function processResults(result) {
     fistHoldCounter = 0;
     freezeGate.holding = false;
     stillness.box = null;
-    if (drag.activeHand && drag.piece) handleDragForHand(drag.activeHand, false, { x: drag.piece.x, y: drag.piece.y });
+    if (drag.activeHand && drag.activeHand !== "pointer" && drag.piece) handleDragForHand(drag.activeHand, false, { x: drag.piece.x, y: drag.piece.y });
     if (appState === "tracking") {
       const sinceLastSeen = performance.now() - lastSeenFrame.at;
       if (lastSeenFrame.box && sinceLastSeen < FRAME_GRACE_MS) {
@@ -1290,7 +1347,7 @@ function processResults(result) {
       const indexPx = toPixel(mirrorLandmarkX(lm[LM.INDEX_TIP]));
       handleDragForHand(label, pinching, indexPx);
     });
-    if (drag.activeHand && !labelsPresent.has(drag.activeHand) && drag.piece) {
+    if (drag.activeHand && drag.activeHand !== "pointer" && !labelsPresent.has(drag.activeHand) && drag.piece) {
       dragMissCounter++;
       if (dragMissCounter > DRAG_MISS_GRACE_FRAMES) {
         dragMissCounter = 0;
